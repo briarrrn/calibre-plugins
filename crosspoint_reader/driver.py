@@ -194,56 +194,86 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
     def free_space(self, end_session=True):
         return 10 * 1024 * 1024 * 1024, 0, 0
 
-    def upload_books(self, files, names, on_card=None, end_session=True, metadata=None):
-        host = self.device_host or PREFS['host']
-        port = self.device_port or PREFS['port']
-        upload_path = PREFS['path']
-        chunk_size = PREFS['chunk_size']
-        if chunk_size > 2048:
-            self._log(f'[CrossPoint] chunk_size capped to 2048 (was {chunk_size})')
-            chunk_size = 2048
-        debug = PREFS['debug']
+def upload_books(self, files, names, on_card=None, end_session=True, metadata=None):
+    host = self.device_host or PREFS['host']
+    port = self.device_port or PREFS['port']
 
-        paths = []
-        total = len(files)
-        for i, (infile, name) in enumerate(zip(files, names)):
-            if hasattr(infile, 'read'):
-                filepath = getattr(infile, 'name', None)
-                if not filepath:
-                    raise ControlError(desc='In-memory uploads are not supported')
+    base_upload_path = PREFS.get('path') or '/'
+    chunk_size = PREFS['chunk_size']
+    if chunk_size > 2048:
+        self._log(f'[CrossPoint] chunk_size capped to 2048 (was {chunk_size})')
+        chunk_size = 2048
+    debug = PREFS['debug']
+
+    # Normalize base path once
+    base = (base_upload_path or '/').replace('\\', '/').strip()
+    if not base.startswith('/'):
+        base = '/' + base
+    if base != '/' and base.endswith('/'):
+        base = base[:-1]
+
+    paths = []
+    total = len(files)
+
+    # Align metadata with files/names if provided
+    if metadata is None:
+        metadata_iter = (None for _ in range(total))
+    else:
+        metadata_iter = iter(metadata)
+
+    for i, (infile, name, mi) in enumerate(zip(files, names, metadata_iter)):
+        if hasattr(infile, 'read'):
+            filepath = getattr(infile, 'name', None)
+            if not filepath:
+                raise ControlError(desc='In-memory uploads are not supported')
+        else:
+            filepath = infile
+
+        # Calibre may hand us a name that contains directories; we only want the filename part here
+        filename = os.path.basename(name)
+
+        # Compute templated destination path using Calibre's device save template logic
+        try:
+            if mi is not None:
+                dest_full = self.create_upload_path(base, mi, filename)
             else:
-                filepath = infile
-            filename = os.path.basename(name)
-            lpath = upload_path
-            if not lpath.startswith('/'):
-                lpath = '/' + lpath
-            if lpath != '/' and lpath.endswith('/'):
-                lpath = lpath[:-1]
-            if lpath == '/':
-                lpath = '/' + filename
-            else:
-                lpath = lpath + '/' + filename
+                dest_full = base + '/' + filename
+        except Exception as exc:
+            self._log(f'[CrossPoint] create_upload_path failed, falling back: {exc}')
+            dest_full = base + '/' + filename
 
-            def _progress(sent, size):
-                if size > 0:
-                    self.report_progress((i + sent / float(size)) / float(total),
-                                         'Transferring books to device...')
+        dest_full = dest_full.replace('\\', '/')
+        if not dest_full.startswith('/'):
+            dest_full = '/' + dest_full
 
-            ws_client.upload_file(
-                host,
-                port,
-                upload_path,
-                filename,
-                filepath,
-                chunk_size=chunk_size,
-                debug=debug,
-                progress_cb=_progress,
-                logger=self._log,
-            )
-            paths.append((lpath, os.path.getsize(filepath)))
+        # Your WS protocol wants: upload_path (dir) + filename
+        dest_dir = os.path.dirname(dest_full) or '/'
+        dest_name = os.path.basename(dest_full)
 
-        self.report_progress(1.0, 'Transferring books to device...')
-        return paths
+        def _progress(sent, size):
+            if size > 0:
+                self.report_progress(
+                    (i + sent / float(size)) / float(total),
+                    'Transferring books to device...'
+                )
+
+        ws_client.upload_file(
+            host,
+            port,
+            dest_dir,      # templated directory
+            dest_name,     # templated filename
+            filepath,
+            chunk_size=chunk_size,
+            debug=debug,
+            progress_cb=_progress,
+            logger=self._log,
+        )
+
+        # Return the full device path so Calibre records it correctly
+        paths.append((dest_full, os.path.getsize(filepath)))
+
+    self.report_progress(1.0, 'Transferring books to device...')
+    return paths
 
     def add_books_to_metadata(self, locations, metadata, booklists):
         metadata = iter(metadata)
